@@ -1,809 +1,738 @@
+// --- LIBRARIES ---
 #include <LiquidCrystal.h>
 #include <Adafruit_Fingerprint.h>
 #include <HardwareSerial.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h> // Required for HTTPS
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <SPI.h> // For SD Card
+#include <SD.h>  // For SD Card
+#include <time.h> // For NTP Time
 
+// --- WIFI AND SERVER CONFIGURATION ---
 #define WIFI_SSID "Alla"
 #define WIFI_PASSWORD "GREA@G&R6"
+#define SERVER_HOST "https://192.168.1.12:7069" // Use your server's host address
+#define NTP_SERVER "pool.ntp.org"
+#define GMT_OFFSET_SEC 3600 * 2 // For EET (Egypt Standard Time, UTC+2)
+#define DAYLIGHT_OFFSET_SEC 0   // No daylight saving for simplicity
 
+// --- HARDWARE PIN DEFINITIONS ---
+// LCD Pins
 const int rs = 19, en = 23, d4 = 32, d5 = 33, d6 = 25, d7 = 26;
+// Fingerprint Sensor RX/TX
+const int FINGERPRINT_RX = 16;
+const int FINGERPRINT_TX = 17;
+// Button Pin
+const int BUTTON_PIN = 18;
+// SD Card CS Pin
+const int SD_CS_PIN = 5; // Standard CS pin for many ESP32 boards, change if needed
+
+// --- GLOBAL OBJECTS ---
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7);
+HardwareSerial fingerSerial(2); // Use UART2 for the sensor
+Adafruit_Fingerprint finger = Adafruit_Fingerprint(&fingerSerial);
+WiFiClientSecure client; // Use a secure client for HTTPS
 
-HardwareSerial mySerial(2);
-Adafruit_Fingerprint finger(&mySerial);
+// --- STATE MANAGEMENT ---
+enum class MenuState {
+  MAIN_MENU,
+  OPTIONS_MENU
+};
+MenuState currentMenuState = MenuState::MAIN_MENU;
 
-const int addButtonPin = 18;
-
+// For storing names locally after fetching from the server
 struct FingerprintData {
   uint16_t id;
   String name;
 };
-FingerprintData fingerprints[128];
-uint16_t nextID = 0;
+FingerprintData fingerprintCache[128]; // Max 128 fingerprints
+const char* LOG_FILE = "/attendance_log.txt";
 
-enum MenuState {
-  MAIN_MENU,
-  SHOW_MENU_CHOICES
-};
-
-MenuState menuState = MAIN_MENU;
-
-unsigned long buttonPressStart = 0;
-bool buttonHeld = false;
-bool waitingForSecondPress = false;
-
+// --- FUNCTION PROTOTYPES ---
 void setupWiFi();
-void displayMainMenu();
-bool addFingerprint();
-void enrollWithRetry();
-void getFingerName(uint16_t id);
-void sendToServer(uint16_t id, String name);
-void scanFingerprint();
-void showMenuChoices();
-void printFingerprintsFromServer();
-void clearServerData();
-bool confirmPassword();
+void displayMessage(String line1, String line2 = "", int delayMs = 0);
+void handleButton();
+void runMainMenuAction();
+void runOptionsMenuAction();
+void enrollNewFingerprint();
+int getFingerprintImage(int step);
+int createAndStoreModel(uint16_t id);
+String getFingerNameFromSerial(uint16_t id);
+void scanForFingerprint();
+void showOptionsMenu();
+void syncAndDisplayServerData();
+void attemptToClearAllData();
+bool confirmAdminPassword();
+void syncSensorWithServer();
+bool sendFingerprintToServer(uint16_t id, const String& name);
+int getNextAvailableIDFromServer();
 
+// New function prototypes for offline logging
+void setupSDCard();
+void setupTime();
+void recordAttendance(uint16_t id);
+bool logAttendanceToServer(uint16_t id, time_t timestamp);
+void logAttendanceOffline(uint16_t id, time_t timestamp);
+void syncOfflineLogs();
+
+// =================================================================================================
+// SETUP FUNCTION
+// =================================================================================================
 void setup() {
   Serial.begin(115200);
+  while (!Serial); // Wait for serial monitor to open
+
+  // --- INITIALIZE LCD ---
   lcd.begin(16, 2);
-  lcd.print("Initializing...");
-  pinMode(addButtonPin, INPUT_PULLUP);
+  displayMessage("System Starting", "Please wait...");
 
-  mySerial.begin(57600, SERIAL_8N1, 16, 17);
-  finger.begin(57600);
+  // --- INITIALIZE SD CARD ---
+  setupSDCard();
 
-  if (!finger.verifyPassword()) {
-    lcd.setCursor(0, 1);
-    lcd.print("Sensor not found!");
-    while (1) delay(1);
-    }
+  // --- INITIALIZE BUTTON ---
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
 
-  if (WiFi.status() == WL_CONNECTED) {
-  lcd.print("WiFi Connected");
-  delay(1000);
-  }
-
-  lcd.clear();
-  setupWiFi();
-  nextID = getNextAvailableIDFromServer();
-  nextID = synchronizeIDs();
-
-  displayMainMenu();
-}
-
-bool syncedOnce = false;
-
-void loop() {
-  static bool menuShown = false;
-  int buttonState = digitalRead(addButtonPin);
-
-  if (WiFi.status() == WL_CONNECTED && !syncedOnce) {
-    Serial.println("🔁 Syncing Sensor to Server...");
-    syncSensorToServer();
-    syncedOnce = true;
-  } else if (WiFi.status() != WL_CONNECTED) {
-    syncedOnce = false; // لما النت يفصل، نرجّع السماح بالمزامنة
-  }
-
-
-  if (buttonState == LOW) {
-    if (!buttonHeld) {
-      buttonPressStart = millis();
-      buttonHeld = true;
-    } else {
-      unsigned long heldTime = millis() - buttonPressStart;
-
-      if (!menuShown && heldTime > 5000) {
-        showMenuChoices();
-        menuState = SHOW_MENU_CHOICES;
-        menuShown = true;
-        delay(500);
-      }
-
-      if (menuState == SHOW_MENU_CHOICES && heldTime > 25000) {
-        if (confirmPassword()) {
-          clearServerData();
-          finger.emptyDatabase();
-          lcd.clear();
-          lcd.print("All Deleted");
-        } else {
-          lcd.clear();
-          lcd.print("Wrong Password");
-        }
-        delay(2000);
-        displayMainMenu();
-        menuState = MAIN_MENU;
-        menuShown = false;
-        buttonHeld = false;
-      }
-    }
+  // --- INITIALIZE FINGERPRINT SENSOR ---
+  fingerSerial.begin(57600, SERIAL_8N1, FINGERPRINT_RX, FINGERPRINT_TX);
+  if (finger.verifyPassword()) {
+    Serial.println("Fingerprint sensor found!");
   } else {
-    if (buttonHeld) {
-      unsigned long heldTime = millis() - buttonPressStart;
-
-      if (menuState == MAIN_MENU && heldTime < 5000) {
-        enrollWithRetry();
-        displayMainMenu();
-      } else if (menuState == SHOW_MENU_CHOICES && heldTime < 2000) {
-        printFingerprintsFromServer();
-        displayMainMenu();
-        menuState = MAIN_MENU;
-        menuShown = false;
-      }
-
-      buttonHeld = false;
-    }
+    displayMessage("Sensor Error", "Check wiring.", 10000);
+    while (1) delay(1); // Halt on error
   }
 
-  scanFingerprint();
-  delay(100);
+  // --- CONNECT TO WIFI ---
+  setupWiFi();
+  
+  // --- CONFIGURE TIME FROM NTP ---
+  setupTime();
+
+  // IMPORTANT: Allow insecure HTTPS connections for local development server
+  client.setInsecure();
+
+  // --- INITIAL SYNC WITH SERVER ---
+  syncSensorWithServer();
+
+  // --- SYNC ANY PENDING OFFLINE LOGS ---
+  syncOfflineLogs();
+
+  displayMessage("Add: Press Btn", "Scan: Place Finger");
 }
 
+// =================================================================================================
+// MAIN LOOP
+// =================================================================================================
+void loop() {
+  handleButton();      // Check for button presses to navigate menus or enroll
+  scanForFingerprint(); // Continuously scan for a known fingerprint
+
+  // Periodically try to sync offline logs if WiFi is available
+  static unsigned long lastSyncAttempt = 0;
+  if (WiFi.status() == WL_CONNECTED && (millis() - lastSyncAttempt > 300000)) { // Every 5 minutes
+      lastSyncAttempt = millis();
+      Serial.println("Periodic check for offline logs to sync...");
+      syncOfflineLogs();
+  }
+
+  delay(50);             // Small delay to prevent overwhelming the processor
+}
+
+// =================================================================================================
+// WIFI & DISPLAY FUNCTIONS
+// =================================================================================================
+/**
+ * @brief Connects to the configured WiFi network.
+ */
 void setupWiFi() {
-  lcd.clear();
-  lcd.print("Connecting WiFi");
-  lcd.setCursor(0, 1);
-  int dots = 0;
+  displayMessage("Connecting WiFi", "...");
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int dots = 0;
   while (WiFi.status() != WL_CONNECTED) {
+    lcd.setCursor(dots, 1);
     lcd.print(".");
-    delay(300);
-    dots++;
-    if (dots > 14) {
+    dots = (dots + 1) % 16;
+    if (dots == 0) {
       lcd.setCursor(0, 1);
       lcd.print("                ");
-      lcd.setCursor(0, 1);
-      dots = 0;
     }
+    delay(500);
+    Serial.print(".");
   }
-  lcd.clear();
-  lcd.print("WiFi Connected");
-  delay(1000);
+  Serial.println("\nWiFi Connected!");
+  displayMessage("WiFi Connected", WiFi.localIP().toString(), 2000);
 }
 
-void displayMainMenu() {
+/**
+ * @brief Displays a two-line message on the LCD and optionally clears it after a delay.
+ */
+void displayMessage(String line1, String line2, int delayMs) {
   lcd.clear();
-  //lcd.setCursor(1, 0);
-  lcd.print("Add : Press The ");
-  lcd.setCursor(5, 1);
-  lcd.print("Button"); 
-}
-
-void enrollWithRetry() {
-  lcd.clear();
-  lcd.print("Place Finger");
-  delay(1000);
-  for (int i = 1; i <= 3; i++) {   // وجهين فقط بدل 3 محاولات
-    lcd.clear();
-    lcd.print("Attempt " + String(i));
-    if (addFingerprint()) {
-      lcd.clear();
-      lcd.print("Success!");
-      delay(2000);
-      return;
-    }
-    delay(1500);
-  }
-  lcd.clear();
-  lcd.print("Failed 3 times");
-  delay(2000);
-}
-
-bool addFingerprint() {
-  int p = -1; // متغير لتخزين نتيجة وظائف المستشعر
-
-  lcd.clear();
-  lcd.print("Place Finger (1/3)"); // توجيه أول للمستخدم
-  Serial.println("Place finger on sensor for first view (1/3)...");
-
-  // الخطوة 1: التقاط الصورة الأولى وتخزينها في المخزن رقم 1
-  p = -1; // إعادة تهيئة المتغير
-  while (p != FINGERPRINT_OK) {
-    p = finger.getImage();
-    if (p == FINGERPRINT_NOFINGER) {
-      // لا يوجد إصبع، ننتظر
-      delay(50);
-    } else if (p == FINGERPRINT_OK) {
-      Serial.println("Image taken.");
-    } else {
-      // أي خطأ آخر في التقاط الصورة
-      lcd.clear();
-      lcd.print("Error! Retrying...");
-      Serial.print("Error getting image: "); Serial.println(p);
-      delay(1000);
-    }
-  }
-  
-  // تحويل الصورة إلى قالب وتخزينها في المخزن 1
-  p = finger.image2Tz(1);
-  if (p != FINGERPRINT_OK) {
-    lcd.clear();
-    lcd.print("Image 1 failed");
-    Serial.print("Image to Template 1 failed: "); Serial.println(p);
-    delay(2000);
-    return false;
-  }
-  Serial.println("Image 1 converted.");
-
-  lcd.clear();
-  lcd.print("Lift Finger"); // توجيه لرفع الإصبع
+  lcd.setCursor(0, 0);
+  lcd.print(line1);
   lcd.setCursor(0, 1);
-  lcd.print("Then Reposition");
-  Serial.println("Lift your finger, then reposition for second view...");
-  delay(1000); // إعطاء وقت كافي لرفع الإصبع
-
-  // التأكد من أن الإصبع قد رفع
-  while (finger.getImage() != FINGERPRINT_NOFINGER) {
-    delay(50);
+  lcd.print(line2);
+  if (delayMs > 0) {
+    delay(delayMs);
   }
-  delay(500); // انتظار قصير للتأكد من خلو المستشعر
+}
 
-  lcd.clear();
-  lcd.print("Place Finger (2/3)"); // توجيه للوجه الثاني
-  Serial.println("Place finger on sensor for second view (2/3)...");
+// =================================================================================================
+// BUTTON & MENU LOGIC
+// =================================================================================================
 
-  // الخطوة 2: التقاط الصورة الثانية وتخزينها في المخزن رقم 2
-  p = -1; // إعادة تهيئة المتغير
-  while (p != FINGERPRINT_OK) {
-    p = finger.getImage();
-    if (p == FINGERPRINT_NOFINGER) {
-      // لا يوجد إصبع، ننتظر
-      delay(50);
-    } else if (p == FINGERPRINT_OK) {
-      Serial.println("Image taken.");
-    } else {
-      // أي خطأ آخر في التقاط الصورة
-      lcd.clear();
-      lcd.print("Error! Retrying...");
-      Serial.print("Error getting image: "); Serial.println(p);
-      delay(1000);
+/**
+ * @brief Handles short and long presses of the button to trigger actions.
+ */
+void handleButton() {
+  static unsigned long buttonPressTime = 0;
+  static bool buttonWasPressed = false;
+
+  bool isPressed = (digitalRead(BUTTON_PIN) == LOW);
+
+  if (isPressed && !buttonWasPressed) {
+    buttonPressTime = millis();
+    buttonWasPressed = true;
+  } else if (!isPressed && buttonWasPressed) {
+    unsigned long pressDuration = millis() - buttonPressTime;
+    if (pressDuration < 5000) { // Short Press (< 5 seconds)
+      if (currentMenuState == MenuState::MAIN_MENU) {
+        runMainMenuAction();
+      } else if (currentMenuState == MenuState::OPTIONS_MENU) {
+        runOptionsMenuAction();
+      }
+    }
+    buttonWasPressed = false;
+  } else if (isPressed && buttonWasPressed) {
+    unsigned long pressDuration = millis() - buttonPressTime;
+    if (pressDuration > 5000 && pressDuration < 5100) { // Long press (triggered once around 5s)
+      if (currentMenuState == MenuState::MAIN_MENU) {
+        showOptionsMenu();
+      }
+    } else if (pressDuration > 10000 && pressDuration < 10100) { // Very long press (triggered once around 10s)
+      if (currentMenuState == MenuState::OPTIONS_MENU) {
+        attemptToClearAllData();
+      }
     }
   }
-  
-  // تحويل الصورة الثانية إلى قالب ومحاولة دمجها مع الأولى
-  p = finger.image2Tz(2);
-  if (p != FINGERPRINT_OK) {
-    lcd.clear();
-    lcd.print("Image 2 failed");
-    Serial.print("Image to Template 2 failed: "); Serial.println(p);
-    delay(2000);
-    return false;
-  }
-  Serial.println("Image 2 converted.");
+}
 
-  // دمج القالبين لإنشاء نموذج بصمة نهائي
-  p = finger.createModel();
-  if (p == FINGERPRINT_OK) {
-    Serial.println("Fingerprint models matched and merged.");
-  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
-    // خطأ في استقبال البيانات (المشكلة هنا بتكون غالبا في عدم تطابق الصورتين كويس)
-    lcd.clear();
-    lcd.print("No Match. Try again"); // توجيه واضح للمستخدم
-    Serial.println("Could not create model: no match between images.");
-    delay(2000);
-    return false;
+void runMainMenuAction() {
+  enrollNewFingerprint();
+  displayMessage("Add: Press Btn", "Scan: Place Finger");
+}
+
+void runOptionsMenuAction() {
+  syncAndDisplayServerData();
+  displayMessage("Add: Press Btn", "Scan: Place Finger");
+  currentMenuState = MenuState::MAIN_MENU;
+}
+
+// =================================================================================================
+// FINGERPRINT ENROLLMENT PROCESS
+// =================================================================================================
+
+void enrollNewFingerprint() {
+  displayMessage("Getting ID...", "From server");
+  int newId = getNextAvailableIDFromServer();
+
+  if (newId < 0 || newId >= 128) {
+    displayMessage("Enroll Failed", "No available ID", 2000);
+    return;
+  }
+  
+  Serial.printf("Starting enrollment for new ID: %d\n", newId);
+  displayMessage("Place finger", "On the sensor");
+
+  if (getFingerprintImage(1) != FINGERPRINT_OK) return;
+
+  displayMessage("Place again", "Same finger");
+  
+  if (getFingerprintImage(2) != FINGERPRINT_OK) return;
+
+  if (createAndStoreModel(newId) != FINGERPRINT_OK) return;
+
+  String name = getFingerNameFromSerial(newId);
+  
+  if (sendFingerprintToServer(newId, name)) {
+    fingerprintCache[newId] = { (uint16_t)newId, name };
+    displayMessage("Enroll Success!", "ID: " + String(newId), 2000);
   } else {
-    // أي خطأ آخر
-    lcd.clear();
-    lcd.print("Model creation fail");
-    Serial.print("Create model failed: "); Serial.println(p);
-    delay(2000);
-    return false;
+    displayMessage("Enroll Failed", "Server error", 2000);
+    finger.deleteModel(newId);
   }
+}
 
-  // الآن نطلب صورة ثالثة لتحسين الجودة إذا أردت
-  // هذه الخطوة اختيارية لكنها تحسن الكفاءة بشكل كبير
-  lcd.clear();
-  lcd.print("Lift Finger (Final)");
-  lcd.setCursor(0,1);
-  lcd.print("Then Reposition");
-  Serial.println("Lift finger for final view (3/3)...");
-  delay(1000);
-  while (finger.getImage() != FINGERPRINT_NOFINGER) {
-    delay(50);
-  }
-  delay(500);
-
-  lcd.clear();
-  lcd.print("Place Finger (3/3)");
-  Serial.println("Place finger on sensor for final view (3/3)...");
-
-  p = -1; // إعادة تهيئة المتغير
+int getFingerprintImage(int step) {
+  int p = -1;
   while (p != FINGERPRINT_OK) {
     p = finger.getImage();
-    if (p == FINGERPRINT_NOFINGER) {
-      delay(50);
-    } else if (p == FINGERPRINT_OK) {
-      Serial.println("Final image taken.");
-    } else {
-      lcd.clear();
-      lcd.print("Error! Retrying...");
-      Serial.print("Error getting final image: "); Serial.println(p);
-      delay(1000);
+    if (p != FINGERPRINT_OK && p != FINGERPRINT_NOFINGER) {
+      displayMessage("Imaging Error", "", 1500);
+      return p;
     }
   }
 
-  // الآن قم بتخزين الصورة الثالثة في المخزن المؤقت ودمجها مع النموذج الموجود
-  p = finger.image2Tz(1); // استخدم المخزن 1 مرة أخرى لتحديث القالب
+  p = finger.image2Tz(step);
   if (p != FINGERPRINT_OK) {
-      lcd.clear();
-      lcd.print("Final Img fail");
-      Serial.print("Image to Template final failed: "); Serial.println(p);
-      delay(2000);
-      return false;
+    displayMessage("Processing Error", "", 1500);
   }
-  Serial.println("Final image converted.");
-  
-  // دمج القالب الجديد (المخزن 1) مع النموذج المخزن بالفعل (المخزن 2)
-  // هنا احنا بنستفيد من خاصية المستشعر إنه يقدر يعمل merge لقالبين
-  // أو ممكن تخزنها مباشرة
-  
-  // لو كنت عايز تحسن الجودة أكتر ممكن تستخدم createModel مرة تانية لو المستشعر بيدعم
-  // أو ممكن تخزن النموذج مباشرة بعد أول دمج ناجح لو مش محتاج 3 وجوه
-  
-  // احنا هنكمل بالطريقة اللي بتخزن مباشرة
-  
-  uint16_t id = nextID; // استخدم الـ ID المتاح التالي
+  return p;
+}
 
-  // تخزين النموذج النهائي في قاعدة بيانات المستشعر بالـ ID المتاح
+int createAndStoreModel(uint16_t id) {
+  displayMessage("Creating model...", "");
+  int p = finger.createModel();
+  if (p != FINGERPRINT_OK) {
+    displayMessage("Fingers do not", "match. Try again.", 2000);
+    return p;
+  }
+
   p = finger.storeModel(id);
-  if (p == FINGERPRINT_OK) {
-    Serial.println("Fingerprint stored successfully.");
-  } else if (p == FINGERPRINT_PACKETRECIEVEERR) {
-    lcd.clear();
-    lcd.print("Store Error!");
-    Serial.println("Store model failed: Packet recieve error (full or bad ID).");
-    delay(2000);
-    return false;
-  } else {
-    lcd.clear();
-    lcd.print("Store Failed!");
-    Serial.print("Store model failed: "); Serial.println(p);
-    delay(2000);
-    return false;
+  if (p != FINGERPRINT_OK) {
+    displayMessage("Storage Error", "Slot may be full.", 2000);
   }
-
-  // البحث عن الـ ID المتاح التالي للاستخدام مستقبلاً
-  nextID = findNextAvailableID();
-
-  // الحصول على اسم البصمة من المستخدم عبر السيريال
-  getFingerName(id);
-
-  // إرسال بيانات البصمة (الـ ID والاسم) إلى السيرفر
-  sendToServer(id, fingerprints[id].name);
-
-  lcd.clear();
-  lcd.print("Added ID: " + String(id));
-  lcd.setCursor(0, 1);
-  lcd.print(fingerprints[id].name);
-  Serial.println("Added fingerprint ID: " + String(id) + ", Name: " + fingerprints[id].name);
-  delay(3000);
-  return true;
+  return p;
 }
 
-void getFingerName(uint16_t id) {
-  lcd.clear();
-  lcd.print("Enter name:");
-  lcd.setCursor(0, 1);
-  lcd.print("Type in Serial");
-  Serial.println("Please type a name and press Enter:");
+String getFingerNameFromSerial(uint16_t id) {
+  displayMessage("Enter name in", "Serial Monitor");
+  Serial.println("Please enter a name for ID " + String(id) + " and press Enter:");
+  
+  unsigned long startTime = millis();
   String name = "";
-  unsigned long start = millis();
-  while (millis() - start < 30000) {
-    while (Serial.available()) {
+  while (millis() - startTime < 30000) {
+    if (Serial.available()) {
       char c = Serial.read();
       if (c == '\n' || c == '\r') {
-        if (name.length() > 0) {
-          fingerprints[id].id = id;
-          fingerprints[id].name = name;
-          return;
-        }
+        if (name.length() > 0) break;
       } else {
         name += c;
       }
     }
-    delay(50);
   }
-  fingerprints[id].id = id;
-  fingerprints[id].name = "User_" + String(id);
-}
-
-void scanFingerprint() {
-  int p = finger.getImage();
-  if (p == FINGERPRINT_OK) {
-    if (finger.image2Tz() != FINGERPRINT_OK) return;
-    p = finger.fingerFastSearch();
-    if (p == FINGERPRINT_OK) {
-      uint16_t id = finger.fingerID;
-      lcd.clear();
-      lcd.print("ID: " + String(id));
-      lcd.setCursor(0, 1);
-      lcd.print("Name: " + fingerprints[id].name);
-      Serial.println("Found ID: " + String(id) + ", Name: " + fingerprints[id].name);
-      delay(2000);
-      displayMainMenu();
-    }
-    else {
-            // في حالة عدم تطابق صوره البصمة مع أي بصمة مخزّنة
-            lcd.clear();
-            lcd.print("Fingerprint Not"); // طباعة رسالة "البصمة غير موجودة"
-            lcd.setCursor(5, 1);
-            lcd.print("Found"); // طباعة "تم العثور عليها"
-            Serial.println("Fingerprint Not Found!"); // طباعة على Serial Monitor
-            delay(2000); // انتظر لمدة 2 ثانية
-            displayMainMenu(); // عرض القائمة الرئيسية
-        }
+  
+  if (name.length() == 0) {
+    name = "User_" + String(id);
+    Serial.println("Timeout. Using default name: " + name);
   }
+  
+  return name;
 }
 
-void showMenuChoices() {
-  lcd.clear();
-  lcd.print("1.Show Data");
-  lcd.setCursor(0, 1);
-  lcd.print("2.Del All:Hold 5s");
+// =================================================================================================
+// CORE OPERATIONS (SCAN, MENU, CLEAR)
+// =================================================================================================
+
+/**
+ * @brief Scans for a fingerprint, displays info, and logs the attendance.
+ */
+void scanForFingerprint() {
+  if (finger.getImage() != FINGERPRINT_OK) return;
+  if (finger.image2Tz() != FINGERPRINT_OK) return;
+  if (finger.fingerFastSearch() != FINGERPRINT_OK) return;
+
+  // Found a match!
+  uint16_t id = finger.fingerID;
+  String name = fingerprintCache[id].name;
+  if (name.isEmpty()) {
+    name = "Name not synced";
+  }
+  
+  displayMessage("Welcome!", "ID: " + String(id) + " " + name, 2000);
+  
+  // Record the attendance log (online or offline)
+  recordAttendance(id);
+  
+  // Return to the main screen
+  displayMessage("Add: Press Btn", "Scan: Place Finger");
 }
 
-void printFingerprintsFromServer() {
+void showOptionsMenu() {
+  currentMenuState = MenuState::OPTIONS_MENU;
+  displayMessage("1.Show Data(short)", "2.Del All(hold 10s)");
+}
+
+void syncAndDisplayServerData() {
   if (WiFi.status() != WL_CONNECTED) {
-    lcd.clear();
-    lcd.print("WiFi Not Conn");
-    delay(1500);
+    displayMessage("WiFi Error", "Not connected", 2000);
     return;
   }
 
+  displayMessage("Getting data...", "From server");
+
   HTTPClient http;
-  String url = "https://192.168.1.12:7069/api/SensorData";
-  http.begin(url);
+  String url = String(SERVER_HOST) + "/api/SensorData";
+  http.begin(client, url);
+
   int httpCode = http.GET();
-  if (httpCode == 200) {
+  if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
-    Serial.println("Server Data:");
-    Serial.println(payload);
+    http.end();
+    
+    DynamicJsonDocument doc(4096);
+    DeserializationError error = deserializeJson(doc, payload);
 
-    DynamicJsonDocument doc(1024);
-    DeserializationError err = deserializeJson(doc, payload);
-    if (!err) {
-      lcd.clear();
-      lcd.print("Data in Serial");
-      for (JsonObject item : doc.as<JsonArray>()) {
-        int id = item["id"];
-        const char* name = item["name"];
-        Serial.printf("ID: %d, Name: %s\n", id, name);
-        delay(100);
-      }
-    } else {
-      lcd.clear();
-      lcd.print("JSON Error");
+    if (error) {
+      Serial.println("Failed to parse server data.");
+      displayMessage("JSON Error", "", 2000);
+      return;
     }
+    
+    displayMessage("Data in Serial", "Monitor", 2000);
+    Serial.println("--- Fingerprint Data from Server ---");
+    for (JsonObject item : doc.as<JsonArray>()) {
+      int id = item["id"];
+      const char* name = item["name"];
+      Serial.printf("ID: %d, Name: %s\n", id, name);
+      if(id >= 0 && id < 128) {
+        fingerprintCache[id] = {(uint16_t)id, String(name)};
+      }
+    }
+    Serial.println("------------------------------------");
+
   } else {
-    lcd.clear();
-    lcd.print("GET Error");
+    http.end();
+    Serial.printf("Failed to get data. HTTP Error: %d\n", httpCode);
+    displayMessage("Server Error", "Code: " + String(httpCode), 2000);
   }
-  http.end();
-  delay(3000);
 }
 
-void clearServerData() {
-  if (WiFi.status() != WL_CONNECTED) {
-    lcd.clear();
-    lcd.print("WiFi Not Conn");
-    delay(1500);
-    return;
-  }
-  HTTPClient http;
-  String url = "https://192.168.1.12:7069/api/SensorData/clear";
-  http.begin(url);
-  int httpCode = http.POST("");
-  if (httpCode == 200) {
-    lcd.clear();
-    lcd.print("Data Cleared");
-    Serial.println("Server data cleared");
+void attemptToClearAllData() {
+  if (confirmAdminPassword()) {
+    displayMessage("Clearing Data...", "");
+    
+    HTTPClient http;
+    String url = String(SERVER_HOST) + "/api/SensorData/clear";
+    http.begin(client, url);
+    int httpCode = http.POST("");
+    http.end();
+
+    if (httpCode == HTTP_CODE_OK) {
+      Serial.println("Server data cleared successfully.");
+      displayMessage("Server Cleared", "Clearing sensor...");
+      
+      if (finger.emptyDatabase() == FINGERPRINT_OK) {
+        Serial.println("Fingerprint sensor cleared.");
+        displayMessage("All Data Deleted", "", 2000);
+      } else {
+        Serial.println("Failed to clear sensor.");
+        displayMessage("Sensor Clear Fail", "", 2000);
+      }
+      
+      for (int i = 0; i < 128; i++) {
+        fingerprintCache[i] = {0, ""};
+      }
+      // Also clear any pending offline logs
+      SD.remove(LOG_FILE);
+
+    } else {
+      Serial.printf("Failed to clear server data. HTTP Error: %d\n", httpCode);
+      displayMessage("Server Clear Fail", "Code: " + String(httpCode), 2000);
+    }
+
   } else {
-    lcd.clear();
-    lcd.print("Clear Fail");
-    Serial.printf("Clear error: %d\n", httpCode);
+    displayMessage("Wrong Password", "Operation Canceled", 2000);
   }
-  http.end();
-  delay(3000);
+  
+  displayMessage("Add: Press Btn", "Scan: Place Finger");
+  currentMenuState = MenuState::MAIN_MENU;
 }
 
-bool confirmPassword() {
-  lcd.clear();
-  lcd.print("Enter Password:");
-  lcd.setCursor(0, 1);
-  lcd.print("Type in Serial");
-
-  Serial.println("Enter admin password:");
+bool confirmAdminPassword() {
+  displayMessage("Enter Password", "in Serial Monitor");
+  Serial.println("ADMIN ACTION: Enter password to confirm data deletion:");
+  
   String input = "";
   unsigned long startTime = millis();
-
   while (millis() - startTime < 30000) {
-    while (Serial.available()) {
+    if (Serial.available()) {
       char c = Serial.read();
       if (c == '\n' || c == '\r') {
-        return input == "admin";
+        if (input == "admin") {
+          Serial.println("Password correct.");
+          return true;
+        } else {
+          Serial.println("Incorrect password.");
+          return false;
+        }
       } else {
         input += c;
       }
     }
-    delay(10);
   }
-
+  Serial.println("Password entry timed out.");
   return false;
 }
 
-uint16_t findNextAvailableID() {
-  Serial.println("Scanning fingerprint storage...");
-  uint16_t usedCount = 0;
+// =================================================================================================
+// SD CARD & OFFLINE LOGGING
+// =================================================================================================
 
-  for (uint16_t id = 0; id < 128; id++) {
-    if (finger.loadModel(id) == FINGERPRINT_OK) {
-      Serial.print("ID in use: ");
-      Serial.println(id);
-      usedCount++;
+/**
+ * @brief Initializes the SD card module.
+ */
+void setupSDCard() {
+    Serial.println("Initializing SD card...");
+    displayMessage("Init SD Card...", "");
+    if (!SD.begin(SD_CS_PIN)) {
+        Serial.println("SD Card initialization failed!");
+        displayMessage("SD Card Error!", "Check connection", 5000);
     } else {
-      Serial.print("ID empty: ");
-      Serial.println(id);
+        Serial.println("SD card initialized.");
+        displayMessage("SD Card OK", "", 1000);
     }
-  }
-
-  Serial.print("Total used IDs: ");
-  Serial.println(usedCount);
-
-  // Return the first available ID
-  for (uint16_t id = 0; id < 128; id++) {
-    if (finger.loadModel(id) != FINGERPRINT_OK) {
-      Serial.print("Next available ID is: ");
-      Serial.println(id);
-      return id;
-    }
-  }
-
-  // fallback if all full
-  Serial.println("All IDs are full, using fallback.");
-  return finger.getTemplateCount();
 }
 
-uint16_t getNextAvailableIDFromServer() {
+/**
+ * @brief Configures and synchronizes time from an NTP server.
+ */
+void setupTime() {
+    Serial.println("Setting up time...");
+    displayMessage("Syncing time...", "");
+    configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER);
+    
+    struct tm timeinfo;
+    if (!getLocalTime(&timeinfo)) {
+        Serial.println("Failed to obtain time");
+        displayMessage("Time Sync Failed", "Check NTP server", 2000);
+        return;
+    }
+    Serial.println("Time synchronized successfully.");
+    displayMessage("Time Synced", "", 1000);
+}
+
+/**
+ * @brief Main function to handle an attendance event. Decides whether to log online or offline.
+ */
+void recordAttendance(uint16_t id) {
+    time_t now = time(nullptr);
+
+    if (now < 1000000000) { // Simple check for a valid Unix timestamp
+        Serial.println("Cannot log attendance: Time not synced.");
+        displayMessage("Log Failed", "Time not synced", 2000);
+        return;
+    }
+
+    if (WiFi.status() == WL_CONNECTED) {
+        if (!logAttendanceToServer(id, now)) {
+            Serial.println("Server log failed. Saving offline.");
+            displayMessage("Server Error", "Logging offline", 1500);
+            logAttendanceOffline(id, now);
+        } else {
+            Serial.println("Attendance logged to server.");
+            displayMessage("Log Sent", "To server", 1500);
+        }
+    } else {
+        Serial.println("No WiFi. Saving attendance offline.");
+        logAttendanceOffline(id, now);
+    }
+}
+
+/**
+ * @brief Logs an attendance record to the SD card.
+ */
+void logAttendanceOffline(uint16_t id, time_t timestamp) {
+    File logFile = SD.open(LOG_FILE, FILE_APPEND);
+    if (!logFile) {
+        Serial.println("Failed to open log file for appending.");
+        displayMessage("SD Write Error", "", 2000);
+        return;
+    }
+    
+    if (logFile.printf("%u,%lu\n", id, timestamp)) {
+        Serial.printf("Successfully wrote log to SD: ID %u, Time %lu\n", id, timestamp);
+        displayMessage("Log Saved", "Offline", 1500);
+    } else {
+        Serial.println("Failed to write to log file.");
+        displayMessage("SD Write Error", "", 2000);
+    }
+    logFile.close();
+}
+
+/**
+ * @brief Reads logs from the SD card and sends them to the server.
+ */
+void syncOfflineLogs() {
+    if (WiFi.status() != WL_CONNECTED) return;
+
+    Serial.println("Starting offline log sync process...");
+    displayMessage("Syncing Logs...", "");
+
+    File logFile = SD.open(LOG_FILE, FILE_READ);
+    if (!logFile || logFile.size() == 0) {
+        if (logFile) logFile.close();
+        Serial.println("No offline logs to sync.");
+        displayMessage("No Offline Logs", "", 1500);
+        return;
+    }
+
+    const char* tempLogFile = "/temp_log.txt";
+    SD.remove(tempLogFile);
+    File tempFile = SD.open(tempLogFile, FILE_WRITE);
+
+    if (!tempFile) {
+        Serial.println("Failed to create temporary log file. Aborting sync.");
+        logFile.close();
+        return;
+    }
+
+    int syncedCount = 0;
+    int failedCount = 0;
+
+    while (logFile.available()) {
+        String line = logFile.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) continue;
+
+        int commaIndex = line.indexOf(',');
+        if (commaIndex == -1) continue;
+
+        uint16_t id = line.substring(0, commaIndex).toInt();
+        time_t timestamp = strtoul(line.substring(commaIndex + 1).c_str(), NULL, 10);
+        
+        if (logAttendanceToServer(id, timestamp)) {
+            syncedCount++;
+        } else {
+            tempFile.println(line);
+            failedCount++;
+        }
+    }
+    
+    logFile.close();
+    tempFile.close();
+
+    SD.remove(LOG_FILE);
+    SD.rename(tempLogFile, LOG_FILE);
+    
+    Serial.printf("Log sync finished. Synced: %d, Failed (re-saved): %d\n", syncedCount, failedCount);
+    if (syncedCount > 0) {
+       displayMessage("Synced " + String(syncedCount) + " logs", "", 2000);
+    } else if (failedCount == 0) {
+       displayMessage("Logs are up", "to date.", 2000);
+    }
+}
+
+// =================================================================================================
+// SERVER COMMUNICATION & SYNC
+// =================================================================================================
+void syncSensorWithServer() {
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, cannot check server IDs.");
-    return finger.getTemplateCount(); // fallback
+    Serial.println("Sync failed: WiFi not connected.");
+    displayMessage("Sync Failed", "No WiFi", 2000);
+    return;
   }
+
+  Serial.println("Syncing sensor with server...");
+  displayMessage("Syncing...", "");
+
+  bool serverHasID[128] = {false};
+  HTTPClient http;
+  String url = String(SERVER_HOST) + "/api/SensorData";
+  http.begin(client, url);
+  int httpCode = http.GET();
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    DynamicJsonDocument doc(4096);
+    if (deserializeJson(doc, payload).code() == DeserializationError::Ok) {
+      for (JsonObject item : doc.as<JsonArray>()) {
+        int id = item["id"];
+        if (id >= 0 && id < 128) {
+          serverHasID[id] = true;
+          fingerprintCache[id] = {(uint16_t)id, String(item["name"].as<const char*>())};
+        }
+      }
+    }
+  }
+  http.end();
+  
+  Serial.println("Checking for orphaned fingerprints on sensor...");
+  for (int id = 0; id < 128; id++) {
+    if (finger.loadModel(id) == FINGERPRINT_OK) {
+      if (!serverHasID[id]) {
+        Serial.printf("ID %d is on sensor but not server. Deleting from sensor.\n", id);
+        finger.deleteModel(id);
+      }
+    }
+  }
+  
+  Serial.println("Sync complete.");
+  displayMessage("Sync Complete", "", 1500);
+}
+
+int getNextAvailableIDFromServer() {
+  if (WiFi.status() != WL_CONNECTED) return -1;
 
   HTTPClient http;
-  String url = "https://192.168.1.12:7069/api/SensorData";
-  http.begin(url);
+  String url = String(SERVER_HOST) + "/api/SensorData/generate-id";
+  http.begin(client, url);
+
   int httpCode = http.GET();
-
-  if (httpCode != 200) {
-    Serial.printf("Failed to fetch server data. HTTP code: %d\n", httpCode);
+  if (httpCode == HTTP_CODE_OK) {
+    int id = http.getString().toInt();
     http.end();
-    return finger.getTemplateCount(); // fallback
-  }
-
-  String payload = http.getString();
-  http.end();
-
-  DynamicJsonDocument doc(4096);
-  DeserializationError err = deserializeJson(doc, payload);
-  if (err) {
-    Serial.println("JSON parsing failed");
-    return finger.getTemplateCount(); // fallback
-  }
-
-  bool usedIDs[128] = { false };
-  for (JsonObject item : doc.as<JsonArray>()) {
-    int id = item["id"];
-    const char* name = item["name"];
-    if (id >= 0 && id < 128) {
-      usedIDs[id] = true;
-      Serial.printf("ID from server: %d, Name: %s\n", id, name);
-    }
-  }
-
-  for (int i = 0; i < 128; i++) {
-    if (!usedIDs[i]) {
-      Serial.printf("First available ID from server: %d\n", i);
-      return i;
-    }
-  }
-
-  Serial.println("All IDs are used on server.");
-  return finger.getTemplateCount(); // fallback
-}
-
-uint16_t synchronizeIDs() {
-  bool serverIDs[128] = { false };
-  bool sensorIDs[128] = { false };
-
-  // 1. Get IDs from server
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin("https://192.168.1.12:7069/api/SensorData");
-    int httpCode = http.GET();
-    if (httpCode == 200) {
-      String payload = http.getString();
-      DynamicJsonDocument doc(4096);
-      DeserializationError err = deserializeJson(doc, payload);
-      if (!err) {
-        for (JsonObject item : doc.as<JsonArray>()) {
-          int id = item["id"];
-          if (id >= 0 && id < 128) {
-            serverIDs[id] = true;
-          }
-        }
-      } else {
-        Serial.println("Failed to parse server JSON.");
-      }
-    } else {
-      Serial.printf("Failed to get server data: %d\n", httpCode);
-    }
-    http.end();
-  }
-
-  // 2. Get IDs from fingerprint sensor
-  for (uint16_t id = 0; id < 128; id++) {
-    if (finger.loadModel(id) == FINGERPRINT_OK) {
-      sensorIDs[id] = true;
-    }
-  }
-
-  // 3. Synchronize both
-  for (uint16_t id = 0; id < 128; id++) {
-    if (sensorIDs[id] && !serverIDs[id]) {
-      // Fingerprint on sensor but not on server — remove it
-      Serial.printf("Deleting ID %d from sensor (not on server)\n", id);
-      finger.deleteModel(id);
-    } else if (!sensorIDs[id] && serverIDs[id]) {
-      // Fingerprint on server but not on sensor — log only, can't add from ESP32
-      Serial.printf("ID %d exists on server but not in sensor.\n", id);
-    }
-  }
-
-  // 4. Return first available ID
-  for (uint16_t id = 0; id < 128; id++) {
-    if (!serverIDs[id] && !sensorIDs[id]) {
-      Serial.printf("Next available synchronized ID: %d\n", id);
-      return id;
-    }
-  }
-
-  // Fallback if all IDs are used
-  return finger.getTemplateCount();
-}
-
-void syncSensorToServer() {
-  uint16_t templateCount = finger.getTemplateCount();
-  Serial.println("🔁 Syncing Sensor to Server...");
-
-  for (uint16_t id = 0; id < 128; id++) {
-    if (finger.loadModel(id) == FINGERPRINT_OK) {
-      String name = fingerprints[id].name;
-
-      lcd.clear();
-      lcd.print("Sync ID: " + String(id));
-
-      if (name == "") {
-        // لا يوجد اسم => نحذفه من السيرفر والسنسور
-        Serial.printf("⚠️ ID %d has no name. Deleting...\n", id);
-        lcd.setCursor(0, 1);
-        lcd.print("Deleting ID: " + String(id));
-
-        // حذف من السيرفر
-        HTTPClient http;
-        String url = "https://192.168.1.12:7069/api/SensorData/" + String(id);
-        http.begin(url);
-        int httpCode = http.sendRequest("DELETE");
-
-        if (httpCode == 200 || httpCode == 204) {
-          Serial.printf("🗑️ Deleted ID %d from Server\n", id);
-        } else {
-          Serial.printf("⚠️ Could not delete ID %d from Server (HTTP %d)\n", id, httpCode);
-        }
-        http.end();
-
-        // حذف من السنسور
-        if (finger.deleteModel(id) == FINGERPRINT_OK) {
-          Serial.printf("✅ Deleted ID %d from Sensor\n", id);
-        } else {
-          Serial.printf("❌ Failed to delete ID %d from Sensor\n", id);
-        }
-
-      } else {
-        // الاسم موجود → نرسل للسيرفر
-        Serial.printf("🟡 Found ID %d, Name: %s\n", id, name.c_str());
-
-        HTTPClient http;
-        String url = "https://192.168.1.12:7069/api/SensorData";
-        http.begin(url);
-        http.addHeader("Content-Type", "application/json");
-
-        DynamicJsonDocument doc(256);
-        doc["id"] = id;
-        doc["name"] = name;
-
-        String jsonStr;
-        serializeJson(doc, jsonStr);
-        int httpCode = http.POST(jsonStr);
-
-        if (httpCode == 200 || httpCode == 201) {
-          Serial.printf("✅ Synced ID %d\n", id);
-          lcd.setCursor(0, 1);
-          lcd.print("Synced & Deleted");
-        } else {
-          Serial.printf("❌ Failed to sync ID %d, HTTP code: %d\n", id, httpCode);
-          lcd.setCursor(0, 1);
-          lcd.print("Sync Failed");
-        }
-
-        http.end();
-      }
-
-      delay(1500); // راحة بسيطة لكل ID
-    }
-  }
-} 
-
-int getFingerprintIDFromServer() {
-  if (WiFi.status() == WL_CONNECTED) {
-    HTTPClient http;
-    http.begin("https://192.168.1.12:7069/api/generate-id"); // استبدل بالرابط الفعلي
-    int httpCode = http.GET();
-
-    if (httpCode == 200) {
-      String payload = http.getString();
-      Serial.println("Received ID: " + payload);
-      http.end();
-      return payload.toInt();  // لازم API يرجع رقم فقط
-    } else {
-      Serial.print("HTTP error: ");
-      Serial.println(httpCode);
-      http.end();
-      return -1;
-    }
+    return id;
   } else {
-    Serial.println("WiFi not connected");
+    Serial.printf("Failed to get next ID. HTTP Error: %d\n", httpCode);
+    http.end();
     return -1;
   }
 }
 
-void sendToServer(uint16_t id, String name) {
-  if (WiFi.status() != WL_CONNECTED) {
-    lcd.clear();
-    lcd.print("WiFi Not Conn");
-    Serial.println("WiFi not connected, saved locally.");
-    return;
-  }
+bool sendFingerprintToServer(uint16_t id, const String& name) {
+  if (WiFi.status() != WL_CONNECTED) return false;
 
   HTTPClient http;
-  String url = "https://192.168.1.12:7069/api/SensorData";
-
-  http.begin(url);
+  String url = String(SERVER_HOST) + "/api/SensorData";
+  http.begin(client, url);
   http.addHeader("Content-Type", "application/json");
 
   DynamicJsonDocument doc(256);
   doc["id"] = id;
   doc["name"] = name;
+  String jsonPayload;
+  serializeJson(doc, jsonPayload);
 
-  String jsonStr;
-  serializeJson(doc, jsonStr);
-
-  int httpCode = http.POST(jsonStr);
-
-  if (httpCode == 200 || httpCode == 201) {
-    lcd.clear();
-    lcd.print("Sent to Server");
-    Serial.println("Data sent: " + jsonStr);
-  } else {
-    lcd.clear();
-    lcd.print("Send Fail");
-    Serial.printf("Send error: %d\n", httpCode);
-  }
-
+  int httpCode = http.POST(jsonPayload);
   http.end();
-  delay(1000);
+  
+  if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+    Serial.println("Fingerprint sent to server successfully.");
+    return true;
+  } else {
+    Serial.printf("Failed to send fingerprint to server. HTTP Error: %d\n", httpCode);
+    return false;
+  }
 }
 
+/**
+ * @brief Sends a single attendance log to the server.
+ */
+bool logAttendanceToServer(uint16_t id, time_t timestamp) {
+    if (WiFi.status() != WL_CONNECTED) return false;
+
+    HTTPClient http;
+    // NOTE: You need to create this API endpoint on your server.
+    String url = String(SERVER_HOST) + "/api/AttendanceLogs";
+    http.begin(client, url);
+    http.addHeader("Content-Type", "application/json");
+
+    DynamicJsonDocument doc(256);
+    doc["fingerprintId"] = id;
+    doc["timestamp"] = timestamp;
+    String jsonPayload;
+    serializeJson(doc, jsonPayload);
+
+    Serial.println("Sending log to server: " + jsonPayload);
+    int httpCode = http.POST(jsonPayload);
+    http.end();
+    
+    if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
+        Serial.printf("Server accepted log. Response: %d\n", httpCode);
+        return true;
+    } else {
+        Serial.printf("Failed to send log to server. HTTP Error: %d\n", httpCode);
+        return false;
+    }
+}
