@@ -1,5 +1,3 @@
-
-
 // --- LIBRARIES ---
 #include <LiquidCrystal.h>        // Library for controlling LCD displays (e.g., 16x2 LCD)
 #include <Adafruit_Fingerprint.h> // Library for interacting with Adafruit fingerprint sensors
@@ -19,7 +17,6 @@
 RTC_DS3231 rtc; // Instantiates an RTC object using the DS3231 module
 
 // --- SERVER AND TIME CONFIGURATION ---
-// WIFI credentials are now handled by WiFiManager and are no longer hardcoded.
 #define SERVER_HOST "https://192.168.1.12:7069" // Defines the base URL of the attendance server (HTTPS)
 #define NTP_SERVER "pool.ntp.org"               // Defines the NTP server for time synchronization
 #define GMT_OFFSET_SEC 3600 * 2                 // Defines the GMT offset for EET (Egypt Standard Time, UTC+2)
@@ -27,14 +24,14 @@ RTC_DS3231 rtc; // Instantiates an RTC object using the DS3231 module
 
 // --- HARDWARE PIN DEFINITIONS ---
 // LCD Pins
-const int rs = 19, en = 23, d4 = 32, d5 = 33, d6 = 25, d7 = 26; // Defines pins for the Liquid Crystal Display
+const int rs = 27, en = 26, d4 = 25, d5 = 33, d6 = 32, d7 = 14; // Defines pins for the Liquid Crystal Display
 // Fingerprint Sensor RX/TX
 const int FINGERPRINT_RX = 16;  // RX pin for the fingerprint sensor's serial communication
 const int FINGERPRINT_TX = 17;  // TX pin for the fingerprint sensor's serial communication
 // Button Pin
-const int BUTTON_PIN = 18;      // Pin for the control button
+const int BUTTON_PIN = 34, BUTTON_PIN2 = 35;      // Pin for the control button
 // SD Card CS Pin
-const int SD_CS_PIN = 13;        // Chip Select (CS) pin for the SD card module
+const int SD_CS_PIN = 5;        // Chip Select (CS) pin for the SD card module
 
 // --- GLOBAL OBJECTS ---
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7);                         // Creates an LCD object with specified pins
