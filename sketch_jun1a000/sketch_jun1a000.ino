@@ -34,7 +34,7 @@ const int FINGERPRINT_TX = 17;  // TX pin for the fingerprint sensor's serial co
 // Button Pin
 const int BUTTON_PIN = 18;      // Pin for the control button
 // SD Card CS Pin
-const int SD_CS_PIN = 5;        // Chip Select (CS) pin for the SD card module
+const int SD_CS_PIN = 13;        // Chip Select (CS) pin for the SD card module
 
 // --- GLOBAL OBJECTS ---
 LiquidCrystal lcd(rs, en, d4, d5, d6, d7);                         // Creates an LCD object with specified pins
