@@ -1,6 +1,6 @@
 /**************************************************************************************************
  * Improved Fingerprint Attendance System for ESP32
- * Version: 5.1 (Corrected and Commented)
+ * Version: 5.3 (Corrected, Refactored, and Fully Commented)
  *
  * Description:
  * A comprehensive fingerprint attendance system using an ESP32. It is designed to be
@@ -14,7 +14,7 @@
  * internet connection is established.
  * - Accurate Timestamps: Uses a DS3231/DS1307 Real-Time Clock (RTC) with a backup battery
  * to ensure timestamps are always accurate, even after power loss.
- * - Full Data Logging: Logs now include the User ID, the full fingerprint template model
+ * - Full Data Logging: Logs include the User ID, the full fingerprint template model
  * (Base64 encoded), and a Unix timestamp for complete record-keeping.
  * - Secure Server Communication: Uses HTTPS for secure data transmission.
  * - User-Friendly Interface: A 16x2 LCD provides clear instructions and feedback.
@@ -40,25 +40,21 @@
 RTC_DS3231 rtc;
 
 // --- SERVER AND TIME CONFIGURATION ---
-#define SERVER_HOST "https://192.168.1.12:7069" // The base URL of your backend server
+#define SERVER_HOST "https://192.168.1.6:7069" // The base URL of your backend server
 #define NTP_SERVER "pool.ntp.org"               // Network Time Protocol server for initial time sync
 #define GMT_OFFSET_SEC 3600 * 2                 // GMT offset for your timezone (e.g., UTC+2 for Egypt Standard Time)
 #define DAYLIGHT_OFFSET_SEC 0                   // Daylight saving offset (0 if not applicable)
 
 // --- FINGERPRINT SENSOR COMMAND CONSTANTS (for manual commands) ---
-#define FINGERPRINT_STARTCODE_1 0xEF
-#define FINGERPRINT_STARTCODE_2 0x01
-#define FINGERPRINT_ADDRESS_H   0xFF
-#define FINGERPRINT_ADDRESS_L   0xFF
-#define FINGERPRINT_PACKETTYPE_COMMAND 0x01
-#define FINGERPRINT_PACKETTYPE_DATA    0x02 // Packet type for receiving data
-#define FINGERPRINT_PACKETTYPE_ACK     0x07 // Packet type for receiving Acknowledge
+// These are used for manually constructing command packets when the library doesn't expose a function.
+#define FINGERPRINT_STARTCODE         0xEF01
+#define FINGERPRINT_COMMANDPACKET     0x1
+#define FINGERPRINT_DATAPACKET        0x2
+#define FINGERPRINT_ACKPACKET         0x7
+#define FINGERPRINT_ENDDATAPACKET     0x8
 
-// Command Codes (أكواد الأوامر)
-#define FINGERPRINT_READTEMPLATE 0x08 // Command to upload a template from a sensor buffer (UpChar)
-
-// Response Codes (أكواد الاستجابات)
-#define FINGERPRINT_ACK_SUCCESS 0x00 // Acknowledgment of success
+// Command Codes
+#define FINGERPRINT_UPCHAR            0x08 // Command to upload a template from a sensor buffer
 
 // --- HARDWARE PIN DEFINITIONS ---
 // LCD Pins (rs, en, d4, d5, d6, d7)
@@ -113,8 +109,8 @@ void scanForFingerprint();
 void enrollNewFingerprint();
 int getFingerprintImage(int step);
 int createAndStoreModel(uint16_t id);
-String getFingerNameFromSerial(uint16_t id);
 String getFingerprintTemplateAsBase64(uint16_t id);
+String getFingerNameFromSerial(uint16_t id);
 
 // RTC, SD Card, and Logging
 void setupSDCard();
@@ -506,42 +502,10 @@ int createAndStoreModel(uint16_t id) {
 }
 
 /**
- * @brief Helper function for enrollment. Prompts user to enter a name via the Serial Monitor.
- * @param id The ID of the fingerprint being named.
- * @return The name entered by the user, or a default name on timeout.
- */
-String getFingerNameFromSerial(uint16_t id) {
-  displayMessage("Enter name in", "Serial Monitor");
-  Serial.println("\n----------------------------------------------------");
-  Serial.println("Please enter a name for ID " + String(id) + " and press Enter:");
-  
-  unsigned long startTime = millis();
-  String name = "";
-  while (millis() - startTime < 30000) { // 30-second timeout
-    if (Serial.available()) {
-      char c = Serial.read();
-      if (c == '\n' || c == '\r') {
-        if (name.length() > 0) break; // Exit if name is not empty
-      } else {
-        name += c;
-      }
-    }
-  }
-  
-  if (name.length() == 0) {
-    name = "User_" + String(id);
-    Serial.println("Timeout. Using default name: " + name);
-  }
-  Serial.println("----------------------------------------------------");
-  
-  return name;
-}
-
-/**
- * @brief [FIXED] Retrieves the fingerprint template for a given ID and encodes it in Base64.
- * This function manually implements the sensor's command protocol because the standard
- * Adafruit library does not provide a public function to directly get the template data
- * from a specific flash location into a user-accessible byte array.
+ * @brief Retrieves the fingerprint template for a given ID and encodes it in Base64.
+ * This function uses a more direct, packet-based communication method because the standard
+ * Adafruit library does not provide a public function to get the full template data from a
+ * specific flash location into a user-accessible byte array.
  * @param id The ID of the fingerprint template to retrieve from the sensor's flash.
  * @return A String containing the Base64 encoded template, or an empty string on failure.
  */
@@ -554,92 +518,111 @@ String getFingerprintTemplateAsBase64(uint16_t id) {
   Serial.printf("Template for ID #%u loaded into sensor buffer.\n", id);
 
   // Step 2: Manually command the sensor to UPLOAD the template from the character buffer to the ESP32.
-  uint8_t buffer_id = 0x01; // The model was loaded into CharBuffer1 by the loadModel() command.
-  
-  // 2a. بناء حزمة الأمر (Build the command packet)
-  byte commandPacket[14]; // Use a safe size to prevent buffer overflow.
-  uint16_t idx = 0;
+  // This is where the manual packet construction happens.
+  uint8_t packet[] = {
+    (uint8_t)(FINGERPRINT_STARTCODE >> 8), (uint8_t)FINGERPRINT_STARTCODE, 
+    0xFF, 0xFF, 0xFF, 0xFF, // Default address
+    FINGERPRINT_COMMANDPACKET, 
+    0x00, 0x04, // Packet length (4 bytes: command, buffer id, 2 for checksum)
+    FINGERPRINT_UPCHAR, 1 // Command to upload from CharBuffer1
+  };
 
-  commandPacket[idx++] = FINGERPRINT_STARTCODE_1;
-  commandPacket[idx++] = FINGERPRINT_STARTCODE_2;
-  commandPacket[idx++] = 0xFF; commandPacket[idx++] = 0xFF; commandPacket[idx++] = 0xFF; commandPacket[idx++] = 0xFF; // Address
-  commandPacket[idx++] = FINGERPRINT_PACKETTYPE_COMMAND;
-  commandPacket[idx++] = 0x00; // Packet Length (High Byte)
-  commandPacket[idx++] = 0x04; // Packet Length (Low Byte) -> Content is 2 bytes (command + buffer_id), Checksum is 2 bytes.
-  commandPacket[idx++] = FINGERPRINT_READTEMPLATE; // The command code for UpChar (0x08).
-  commandPacket[idx++] = buffer_id;               // The buffer to upload from.
-
-  // 2b. Calculate and add the checksum.
-  uint16_t checksum = 0;
-  for (int i = 6; i < idx; i++) { // Checksum is calculated on Packet Type, Length, and Content.
-    checksum += commandPacket[i];
+  // Calculate checksum
+  uint16_t sum = 0;
+  for (int i = 6; i < 11; i++) {
+    sum += packet[i];
   }
-  commandPacket[idx++] = (checksum >> 8) & 0xFF; // Checksum High Byte
-  commandPacket[idx++] = checksum & 0xFF;       // Checksum Low Byte
+  
+  // Send the command packet
+  fingerSerial.write(packet, 11);
+  fingerSerial.write((uint8_t)(sum >> 8));
+  fingerSerial.write((uint8_t)(sum & 0xFF));
 
-  // 2c. إرسال حزمة الأمر إلى الحساس (Send the complete command packet to the sensor).
-  // IMPORTANT: Use the correct serial object 'fingerSerial' that was initialized.
-  fingerSerial.write(commandPacket, idx);
+  // Step 3: Wait for and read the data packets containing the template.
+  const int templateSize = 512; // A full fingerprint model is 512 bytes.
+  uint8_t fingerprintTemplate[templateSize];
+  int index = 0;
+  bool endOfData = false;
+  uint32_t startTime = millis();
 
-  // Step 3: انتظار استقبال حزمة الإقرار (Wait for the ACK packet from the sensor).
-  unsigned long startTime = millis();
-  byte response[12];
-  int responseIdx = 0;
-  bool ackReceived = false;
+  while (!endOfData && (millis() - startTime < 2000)) { // 2-second timeout
+    if (fingerSerial.available() < 9) { // Wait for at least a packet header
+      delay(1);
+      continue;
+    }
+    
+    // Read the packet header to determine what type of packet it is.
+    if (fingerSerial.read() != (uint8_t)(FINGERPRINT_STARTCODE >> 8)) continue;
+    if (fingerSerial.read() != (uint8_t)(FINGERPRINT_STARTCODE & 0xFF)) continue;
+    fingerSerial.read(); fingerSerial.read(); fingerSerial.read(); fingerSerial.read(); // Skip address
+    
+    uint8_t packet_type = fingerSerial.read();
+    uint16_t length = ((uint16_t)fingerSerial.read()) << 8;
+    length |= fingerSerial.read();
 
-  // It's good practice to clear any old data from the incoming serial buffer first.
-  while (fingerSerial.available()) fingerSerial.read();
+    if (packet_type == FINGERPRINT_ACKPACKET) {
+      // It's just the ACK, the data will follow. We can ignore it for this implementation.
+      continue;
+    }
 
-  while ((millis() - startTime < 1000) && !ackReceived) { // 1-second timeout for ACK
-    if (fingerSerial.available()) {
-      response[responseIdx++] = fingerSerial.read();
-      if (responseIdx >= 12) { // Once a full ACK packet is likely received
-        // Verify it's a valid ACK packet with a success code.
-        if (response[0] == FINGERPRINT_STARTCODE_1 && response[6] == FINGERPRINT_PACKETTYPE_ACK && response[9] == FINGERPRINT_ACK_SUCCESS) {
-            Serial.println("ACK received. Sensor is now sending template data.");
-            ackReceived = true;
-        } else {
-          responseIdx = 0; // Invalid packet, reset and try again.
-        }
+    if (packet_type == FINGERPRINT_DATAPACKET || packet_type == FINGERPRINT_ENDDATAPACKET) {
+      if (index + length - 2 > templateSize) {
+          Serial.println("Error: Template data exceeds buffer size.");
+          return "";
       }
+      // Read the data payload from the packet (length - 2 to exclude checksum).
+      fingerSerial.readBytes(fingerprintTemplate + index, length - 2);
+      index += (length - 2);
+      
+      // The last packet is marked as an ENDDATAPACKET.
+      if (packet_type == FINGERPRINT_ENDDATAPACKET) {
+        endOfData = true;
+      }
+    } else {
+        // Unexpected packet type.
+        Serial.printf("Unexpected packet type: 0x%X\n", packet_type);
+        return "";
     }
   }
 
-  if (!ackReceived) {
-    Serial.println("Error: No ACK packet received from sensor within timeout.");
-    return "";
-  }
-
-  // Step 4: استقبال حزمة البيانات التي تحتوي على القالب (Receive the data packet(s) with the template).
-  // NOTE: This implementation assumes a template size of 256 bytes, as it's common in some models
-  // and implied by your original code. The standard size for many ZhianTec sensors (like R307) is 512 bytes.
-  // If logging fails or templates seem incomplete, change templateSize to 512 and increase the
-  // ArduinoJson document size in logAttendanceToServer accordingly.
-  const int templateSize = 256;
-  byte fingerprintTemplate[templateSize];
-  
-  // Clear buffer again before reading the main data packet.
-  while (fingerSerial.available()) fingerSerial.read();
-  
-  Serial.println("Waiting for template data...");
-  startTime = millis();
-  // Use readBytes with a timeout to receive the template data.
-  int bytesRead = fingerSerial.readBytes(fingerprintTemplate, templateSize);
-  
-  if (bytesRead == templateSize) {
-      Serial.println("Full template data received successfully.");
-      // The sensor also sends a 2-byte checksum after the data, which we can ignore and clear from the buffer.
-      while(fingerSerial.available()) fingerSerial.read(); 
-      
-      // Step 5: تشفير قالب البصمة إلى Base64 using the provided utility function.
-      String encodedModelString = base64Encode(fingerprintTemplate, templateSize);
-
-      Serial.println("Fingerprint template has been encoded to Base64.");
-      return encodedModelString;
+  if (endOfData) {
+      Serial.printf("Full template data received successfully (%d bytes).\n", index);
+      // Step 4: Encode the complete template to Base64.
+      return base64Encode(fingerprintTemplate, index);
   } else {
-      Serial.printf("Error: Timed out or failed to receive full template. Expected %d bytes, got %d.\n", templateSize, bytesRead);
+      Serial.println("Error: Timed out or failed to receive full template.");
       return "";
   }
+}
+
+/**
+ * @brief Helper function for enrollment. Prompts user to enter a name via the Serial Monitor.
+ * @param id The ID of the fingerprint being named.
+ * @return The name entered by the user, or a default name on timeout.
+ */
+String getFingerNameFromSerial(uint16_t id) {
+  displayMessage("Enter name in", "Serial Monitor");
+  Serial.println("Please enter a name for ID " + String(id) + " and press Enter:");
+  
+  unsigned long startTime = millis();
+  String name = "";
+  while (millis() - startTime < 30000) { // 30-second timeout
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n' || c == '\r') {
+        if (name.length() > 0) break;
+      } else {
+        name += c;
+      }
+    }
+  }
+  
+  if (name.length() == 0) {
+    name = "User_" + String(id);
+    Serial.println("Timeout. Using default name: " + name);
+  }
+  
+  return name;
 }
 
 // =================================================================================================
@@ -809,7 +792,7 @@ void syncOfflineLogs() {
         // Parse the CSV line to extract the three data fields.
         int firstComma = line.indexOf(',');
         int lastComma = line.lastIndexOf(',');
-        if (firstComma == -1 || lastComma == -1 || firstComma == lastComma) continue; // Skip malformed lines.
+        if (firstComma == -1 || lastComma == -1 || firstComma == lastComma) continue; // Skip malformed lines
 
         uint16_t id = line.substring(0, firstComma).toInt();
         String base64Template = line.substring(firstComma + 1, lastComma);
@@ -817,9 +800,9 @@ void syncOfflineLogs() {
         
         // Attempt to send the parsed log to the server.
         if (logAttendanceToServer(id, base64Template, timestamp)) {
-            syncedCount++; // Success.
+            syncedCount++; // Success
         } else {
-            // If it fails, write this log entry to the temporary file to be tried again later.
+            // If it fails, write it to the temporary file to be tried again later.
             tempFile.println(line);
             failedCount++;
         }
@@ -828,8 +811,7 @@ void syncOfflineLogs() {
     logFile.close();
     tempFile.close();
 
-    // Atomically replace the old log file with the temporary file. The temporary file now
-    // contains only the logs that failed to sync, preserving them for the next attempt.
+    // Replace the old log file with the temporary file (which now only contains unsynced logs).
     SD.remove(LOG_FILE);
     SD.rename(tempLogFile, LOG_FILE);
     
@@ -873,7 +855,8 @@ void syncAndDisplayServerData() {
     String payload = http.getString();
     http.end();
     
-    DynamicJsonDocument doc(4096); // Use a reasonably large JSON doc for the user list
+    // Use the modern JsonDocument
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, payload);
 
     if (error) {
@@ -1013,7 +996,7 @@ void syncSensorWithServer() {
   int httpCode = http.GET();
   if (httpCode == HTTP_CODE_OK) {
     String payload = http.getString();
-    DynamicJsonDocument doc(4096);
+    JsonDocument doc;
     if (deserializeJson(doc, payload).code() == DeserializationError::Ok) {
       for (JsonObject item : doc.as<JsonArray>()) {
         int id = item["id"];
@@ -1085,7 +1068,7 @@ bool sendFingerprintToServer(uint16_t id, const String& name) {
   http.addHeader("Content-Type", "application/json");
 
   // Create the JSON payload.
-  DynamicJsonDocument doc(256);
+  JsonDocument doc;
   doc["id"] = id;
   doc["name"] = name;
   String jsonPayload;
@@ -1121,7 +1104,7 @@ bool logAttendanceToServer(uint16_t id, const String& base64Template, time_t tim
     http.addHeader("Content-Type", "application/json");
 
     // Create a larger JSON document to accommodate the Base64 template.
-    DynamicJsonDocument doc(1024);
+    JsonDocument doc;
     doc["fingerprintId"] = id;
     doc["fingerprintModel"] = base64Template;
     doc["timestamp"] = timestamp;
@@ -1130,19 +1113,19 @@ bool logAttendanceToServer(uint16_t id, const String& base64Template, time_t tim
 
     Serial.println("Sending attendance log to server...");
     int httpCode = http.POST(jsonPayload);
-    http.end();
     
     if (httpCode == HTTP_CODE_OK || httpCode == HTTP_CODE_CREATED) {
         Serial.printf("Server accepted attendance log. Response code: %d\n", httpCode);
+        http.end();
         return true;
     } else {
         Serial.printf("Failed to send log to server. HTTP Error: %d\n", httpCode);
         String responseBody = http.getString();
         Serial.println("Server response: " + responseBody);
+        http.end();
         return false;
     }
 }
-
 
 // =================================================================================================
 // UTILITY FUNCTIONS
